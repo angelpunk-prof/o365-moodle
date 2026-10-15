@@ -396,6 +396,10 @@ class observers {
                     'timemodified' => $now,
                 ];
                 $userobjectdata->id = $DB->insert_record('local_o365_objects', $userobjectdata);
+
+                // Push existing course enrolments to the connected Microsoft 365 groups now that the user is mapped.
+                // This only queues ad-hoc tasks, so it does not add Microsoft Graph calls to the login request.
+                \local_o365\feature\coursesync\utils::queue_course_group_sync_for_user((int) $userid);
             }
 
             // Sync profile photo and timezone.

@@ -134,4 +134,13 @@ $tasks = [
         'dayofweek' => '*',
         'month' => '*',
     ],
+    [
+        'classname' => 'local_o365\task\coursegroupmembershipreconcile',
+        'blocking' => 0,
+        'minute' => '17',
+        'hour' => '2',
+        'day' => '*',
+        'dayofweek' => '*',
+        'month' => '*',
+    ],
 ];

@@ -221,6 +221,14 @@ class processmatchqueue extends scheduled_task {
                             'timemodified' => $now,
                         ];
                         $DB->insert_record('local_o365_objects', $userobjectdata);
+
+                        // Push existing course enrolments to the connected Microsoft 365 groups now that the user is mapped.
+                        $queued = \local_o365\feature\coursesync\utils::queue_course_group_sync_for_user(
+                            (int) $matchrec->muserid
+                        );
+                        if ($queued) {
+                            mtrace('Queued course group membership sync for ' . $queued . ' course(s).');
+                        }
                     }
 
                     // Updated the user's authentication method field.

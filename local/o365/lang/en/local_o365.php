@@ -831,6 +831,7 @@ $string['erroro365apinoparentinfo'] = 'Could not find parent folder information'
 $string['erroro365apinotimplemented'] = 'This should be overridden.';
 $string['erroro365apinotoken'] = 'Did not have a token for the given resource and user, and could not get one. Is the user\'s refresh token expired?';
 $string['erroro365apisiteexistsnolocal'] = 'Site already exists, but could not find local record.';
+$string['errorusergroupmembershipsyncgraph'] = 'Microsoft Graph API error while syncing Moodle user {$a->userid} in course {$a->courseid} to the connected Microsoft 365 group. The task will be retried.';
 $string['errorusermatched'] = 'The Microsoft 365 account "{$a->entraidupn}" is already matched with Moodle user "{$a->username}". To complete the connection, please log in as that Moodle user first and follow the instructions in the Microsoft block.';
 $string['errornodirectaccess'] = 'Direct access to the page is prohibited';
 $string['eventapifail'] = 'API failure';
@@ -975,6 +976,7 @@ $string['ucp_o365accountconnected'] = 'This Microsoft 365 account is already con
 // Tasks.
 $string['task_calendarsyncin'] = 'Sync Microsoft 365 events in to Moodle';
 $string['task_coursesync'] = 'Sync Moodle courses to Microsoft Teams';
+$string['task_coursegroupmembershipreconcile'] = 'Reconcile Microsoft 365 group owners and members with Moodle course enrolments';
 $string['task_coursemembershipsync'] = 'Sync Microsoft Teams owners and members to Moodle courses';
 $string['task_sds_sync'] = 'Sync with SDS';
 $string['task_syncusers'] = 'Sync users from Microsoft Entra ID';
