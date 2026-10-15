@@ -26,7 +26,9 @@
 namespace local_o365\task;
 
 use core\task\adhoc_task;
+use local_o365\feature\coursesync\utils as coursesyncutils;
 use local_o365\utils;
+use moodle_exception;
 
 defined('MOODLE_INTERNAL') || die();
 
@@ -60,7 +62,11 @@ class usergroupmembershipsync extends adhoc_task {
      *   - sdscoursechecked (bool)           Optional: true when the observer already verified SDS sync eligibility,
      *                                       allowing sync_user_role_in_course_group to skip the redundant SDS check.
      *
-     * @return bool
+     * "Nothing to do" outcomes (e.g. the user has no Microsoft Entra ID mapping yet) are logged and the task completes. A
+     * Microsoft Graph failure throws an exception, so that the task is retried using Moodle's ad-hoc task fail delay / backoff.
+     *
+     * @return bool True if the user's role was synced, false if there was nothing to do.
+     * @throws moodle_exception If the sync failed because of a Microsoft Graph error, so the task is retried.
      */
     public function execute(): bool {
         $data = $this->get_custom_data();
@@ -77,14 +83,21 @@ class usergroupmembershipsync extends adhoc_task {
 
         $courseusersyncdirection = get_config('local_o365', 'courseusersyncdirection');
         if ($courseusersyncdirection == COURSE_USER_SYNC_DIRECTION_TEAMS_TO_MOODLE) {
+            mtrace('... usergroupmembershipsync: course user sync direction is Teams to Moodle, skipping.');
             return false;
         }
 
-        if (utils::is_connected() !== true || \local_o365\feature\coursesync\utils::is_enabled() !== true) {
+        if (coursesyncutils::is_enabled() !== true) {
+            mtrace('... usergroupmembershipsync: course sync is disabled, skipping.');
             return false;
         }
 
-        if (\local_o365\feature\coursesync\utils::is_course_sync_enabled((int) $data->courseid) !== true) {
+        if (utils::is_connected() !== true) {
+            mtrace('... usergroupmembershipsync: Microsoft 365 is not connected, skipping.');
+            return false;
+        }
+
+        if (coursesyncutils::is_course_sync_enabled((int) $data->courseid) !== true) {
             mtrace("... usergroupmembershipsync: course sync disabled for course {$data->courseid}, skipping.");
             return false;
         }
@@ -95,7 +108,7 @@ class usergroupmembershipsync extends adhoc_task {
 
         mtrace("... Syncing user {$data->userid} in course {$data->courseid} to Microsoft 365 group.");
 
-        return \local_o365\feature\coursesync\utils::sync_user_role_in_course_group(
+        $status = coursesyncutils::sync_user_role_in_course_group_with_status(
             (int) $data->userid,
             (int) $data->courseid,
             0,
@@ -103,5 +116,17 @@ class usergroupmembershipsync extends adhoc_task {
             $sdscoursechecked,
             $excluderoleid
         );
+
+        if ($status === coursesyncutils::USER_ROLE_SYNC_GRAPH_ERROR) {
+            // Throw so that the ad-hoc task is marked as failed and retried later with Moodle's fail delay / backoff.
+            throw new moodle_exception(
+                'errorusergroupmembershipsyncgraph',
+                'local_o365',
+                '',
+                (object) ['userid' => (int) $data->userid, 'courseid' => (int) $data->courseid]
+            );
+        }
+
+        return $status === coursesyncutils::USER_ROLE_SYNC_SUCCESS;
     }
 }

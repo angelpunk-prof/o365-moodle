@@ -27,20 +27,40 @@
 namespace local_o365\feature\coursesync;
 
 use core\context\course;
+use core\task\manager;
 use local_o365\httpclient;
 use local_o365\oauth2\clientdata;
 use local_o365\rest\unified;
+use local_o365\task\usergroupmembershipsync;
 use moodle_exception;
 use stdClass;
 
 defined('MOODLE_INTERNAL') || die();
 
 require_once($CFG->libdir . '/enrollib.php');
+require_once($CFG->dirroot . '/local/o365/lib.php');
 
 /**
  * A utility class for the group / team sync feature.
  */
 class utils {
+    /** @var int sync_user_role_in_course_group_with_status() result: the user's group role was synced. */
+    public const USER_ROLE_SYNC_SUCCESS = 0;
+
+    /** @var int sync_user_role_in_course_group_with_status() result: missing user ID or course ID. */
+    public const USER_ROLE_SYNC_INVALID_ARGUMENTS = 1;
+
+    /** @var int sync_user_role_in_course_group_with_status() result: the course is not connected to a Microsoft 365 group. */
+    public const USER_ROLE_SYNC_NO_COURSE_GROUP = 2;
+
+    /** @var int sync_user_role_in_course_group_with_status() result: the user has no Microsoft Entra ID mapping. */
+    public const USER_ROLE_SYNC_NO_USER_MAPPING = 3;
+
+    /** @var int sync_user_role_in_course_group_with_status() result: SDS course with SDS enrolment sync disabled. */
+    public const USER_ROLE_SYNC_SDS_SYNC_DISABLED = 4;
+
+    /** @var int sync_user_role_in_course_group_with_status() result: Microsoft Graph client or API call failed. */
+    public const USER_ROLE_SYNC_GRAPH_ERROR = 5;
     /**
      * Determine whether the course sync feature is enabled or not.
      *
@@ -745,7 +765,8 @@ class utils {
         $userroles = get_user_roles($coursecontext, $userid, false);
         $userroleids = array_column($userroles, 'roleid');
         if ($excluderoleid) {
-            unset($userroleids[$excluderoleid]);
+            // The array is a 0-indexed list of role IDs, so exclude by value rather than by key.
+            $userroleids = array_values(array_diff($userroleids, [$excluderoleid]));
         }
 
         // Get group owner and member roles.
@@ -766,13 +787,17 @@ class utils {
     /**
      * Sync the user's role in the Microsoft 365 group connected the course.
      *
+     * This is a backward compatible wrapper around sync_user_role_in_course_group_with_status(). Microsoft Graph errors are
+     * logged and reported as false rather than thrown, because this is called synchronously from event observers, including
+     * during user login. Every unsuccessful outcome is logged.
+     *
      * @param int $userid
      * @param int $courseid
      * @param int $userobjectrecordid
      * @param int $coursegroupobjectrecordid
      * @param bool $sdscoursechecked
      * @param int $excluderoleid
-     * @return bool
+     * @return bool True if the user's role was synced, false if there was nothing to do or an error occurred.
      */
     public static function sync_user_role_in_course_group(
         int $userid,
@@ -782,28 +807,76 @@ class utils {
         bool $sdscoursechecked = false,
         int $excluderoleid = 0
     ): bool {
+        $status = static::sync_user_role_in_course_group_with_status(
+            $userid,
+            $courseid,
+            $userobjectrecordid,
+            $coursegroupobjectrecordid,
+            $sdscoursechecked,
+            $excluderoleid
+        );
+
+        return $status === self::USER_ROLE_SYNC_SUCCESS;
+    }
+
+    /**
+     * Sync the user's role in the Microsoft 365 group connected the course, and return a status code describing the outcome.
+     *
+     * Missing mappings and Microsoft Graph errors are reported through the return value, never thrown, because this is called
+     * synchronously from event observers. Callers that want Microsoft Graph failures to be retried (e.g. the
+     * usergroupmembershipsync ad-hoc task) should check for self::USER_ROLE_SYNC_GRAPH_ERROR, which is distinct from the
+     * "nothing to do" outcomes.
+     *
+     * Local (database) checks are performed before the Microsoft Graph API client is created, so that the "nothing to do"
+     * outcomes do not cost any Microsoft Graph API calls.
+     *
+     * @param int $userid
+     * @param int $courseid
+     * @param int $userobjectrecordid
+     * @param int $coursegroupobjectrecordid
+     * @param bool $sdscoursechecked
+     * @param int $excluderoleid
+     * @return int One of the self::USER_ROLE_SYNC_* constants.
+     */
+    public static function sync_user_role_in_course_group_with_status(
+        int $userid,
+        int $courseid,
+        int $userobjectrecordid = 0,
+        int $coursegroupobjectrecordid = 0,
+        bool $sdscoursechecked = false,
+        int $excluderoleid = 0
+    ): int {
         global $DB;
 
         if (empty($userid) || empty($courseid)) {
-            return false;
+            static::log_user_role_sync_outcome('missing user ID or course ID.', $userid, $courseid);
+            return self::USER_ROLE_SYNC_INVALID_ARGUMENTS;
         }
-
-        $apiclient = static::get_unified_api(__METHOD__);
-        $coursesync = new main($apiclient);
 
         // Ensure course is connected.
         if (!$coursegroupobjectrecordid) {
-            $coursegroupobjectrecordid = static::get_group_object_record_id_by_course_id($courseid);
+            $coursegroupobjectrecordid = (int) static::get_group_object_record_id_by_course_id($courseid);
             if (!$coursegroupobjectrecordid) {
-                return false;
+                static::log_user_role_sync_outcome(
+                    'course is not connected to a Microsoft 365 group (no local_o365_objects group/course record).',
+                    $userid,
+                    $courseid
+                );
+                return self::USER_ROLE_SYNC_NO_COURSE_GROUP;
             }
         }
 
         // Ensure user is connected.
         if (!$userobjectrecordid) {
-            $userobjectrecordid = static::get_user_object_record_id_by_user_id($userid);
+            $userobjectrecordid = (int) static::get_user_object_record_id_by_user_id($userid);
             if (!$userobjectrecordid) {
-                return false;
+                static::log_user_role_sync_outcome(
+                    'user has no Microsoft Entra ID mapping (no local_o365_objects user record) yet. Membership will be synced ' .
+                    'when the mapping is created, or by the course group membership reconcile task.',
+                    $userid,
+                    $courseid
+                );
+                return self::USER_ROLE_SYNC_NO_USER_MAPPING;
             }
         }
 
@@ -812,66 +885,184 @@ class utils {
             if ($DB->record_exists('local_o365_objects', ['type' => 'sdssection', 'moodleid' => $courseid])) {
                 // For SDS courses, only perform sync if advanced enrolment sync option is enabled.
                 if (!get_config('local_o365', 'sdssyncenrolmenttosds')) {
-                    return false;
+                    static::log_user_role_sync_outcome(
+                        'course is an SDS course and the "sdssyncenrolmenttosds" setting is disabled.',
+                        $userid,
+                        $courseid
+                    );
+                    return self::USER_ROLE_SYNC_SDS_SYNC_DISABLED;
                 }
             }
+        }
+
+        // Get group and user object IDs.
+        $groupobjectid = static::get_object_id_by_record_id($coursegroupobjectrecordid);
+        if (!$groupobjectid) {
+            static::log_user_role_sync_outcome(
+                'course group object record ' . $coursegroupobjectrecordid . ' no longer exists.',
+                $userid,
+                $courseid
+            );
+            return self::USER_ROLE_SYNC_NO_COURSE_GROUP;
+        }
+
+        $userobjectid = static::get_object_id_by_record_id($userobjectrecordid);
+        if (!$userobjectid) {
+            static::log_user_role_sync_outcome(
+                'user object record ' . $userobjectrecordid . ' no longer exists.',
+                $userid,
+                $courseid
+            );
+            return self::USER_ROLE_SYNC_NO_USER_MAPPING;
         }
 
         // Determine user group role.
         $grouprole = static::get_user_group_role_by_moodle_ids($userid, $courseid, $excluderoleid);
 
-        // Get group and user object IDs.
-        $groupobjectid = static::get_object_id_by_record_id($coursegroupobjectrecordid);
-        $userobjectid = static::get_object_id_by_record_id($userobjectrecordid);
+        // Only create the Microsoft Graph API client once we know there is something to do.
+        $coursesync = null;
+        $clientexception = null;
+        try {
+            $apiclient = static::get_unified_api(__METHOD__);
+            if ($apiclient) {
+                $coursesync = new main($apiclient);
+            }
+        } catch (moodle_exception $e) {
+            $clientexception = $e;
+        }
 
-        // If the user doesn't have any group role, remove the user from the connected group.
-        if (!$grouprole) {
-            try {
-                // Remove owner and member from the Microsoft 365 group.
+        if (!$coursesync) {
+            static::log_user_role_sync_outcome(
+                'could not create a Microsoft Graph API client (no application token, or Microsoft Graph unavailable).',
+                $userid,
+                $courseid,
+                $clientexception
+            );
+            return self::USER_ROLE_SYNC_GRAPH_ERROR;
+        }
+
+        try {
+            if (!$grouprole || !is_enrolled(course::instance($courseid), $userid, null, true)) {
+                // The user doesn't have any group role, or doesn't have an active enrolment any more (e.g. suspended).
+                // Remove user as owner and member from the Microsoft 365 group.
                 $coursesync->remove_member_from_group($groupobjectid, $userobjectid);
                 $coursesync->remove_owner_from_group($groupobjectid, $userobjectid);
-            } catch (moodle_exception $e) {
-                \local_o365\utils::debug('Exception: ' . $e->getMessage(), __METHOD__, $e);
-                return false;
-            }
-        } else {
-            // Check if the user was suspended, or unsuspended. Add or remove them in the Microsoft 365 group as appropriate.
-            if (!is_enrolled(course::instance($courseid), $userid, null, true)) {
-                // The user doesn't have a valid enrolment any more - we need to remove the user.
-                try {
-                    // Remove user as owner and member from the Microsoft 365 group.
-                    $coursesync->remove_member_from_group($groupobjectid, $userobjectid);
-                    $coursesync->remove_owner_from_group($groupobjectid, $userobjectid);
-                } catch (moodle_exception $e) {
-                    \local_o365\utils::debug('Exception: ' . $e->getMessage(), __METHOD__, $e);
-                    return false;
-                }
             } else {
                 // The user has a valid enrolment, we need to add the user.
-                try {
-                    switch ($grouprole) {
-                        case MICROSOFT365_GROUP_ROLE_OWNER:
-                            // Add user to the Microsoft 365 group as owner.
-                            $coursesync->add_owner_to_group($groupobjectid, $userobjectid);
-                            break;
-                        case MICROSOFT365_GROUP_ROLE_MEMBER:
-                            // Add user to the Microsoft 365 group as member.
-                            $groupowners = $coursesync->get_group_owners($groupobjectid);
-                            if (array_key_exists($userobjectid, $groupowners)) {
-                                $coursesync->remove_owner_from_group($groupobjectid, $userobjectid);
-                            }
+                switch ($grouprole) {
+                    case MICROSOFT365_GROUP_ROLE_OWNER:
+                        // Add user to the Microsoft 365 group as owner.
+                        $coursesync->add_owner_to_group($groupobjectid, $userobjectid);
+                        break;
+                    case MICROSOFT365_GROUP_ROLE_MEMBER:
+                        // Add user to the Microsoft 365 group as member.
+                        $groupowners = $coursesync->get_group_owners($groupobjectid);
+                        if (array_key_exists($userobjectid, $groupowners)) {
+                            $coursesync->remove_owner_from_group($groupobjectid, $userobjectid);
+                        }
 
-                            $coursesync->add_member_to_group($groupobjectid, $userobjectid);
-                            break;
-                    }
-                } catch (moodle_exception $e) {
-                    \local_o365\utils::debug('Exception: ' . $e->getMessage(), __METHOD__, $e);
-                    return false;
+                        $coursesync->add_member_to_group($groupobjectid, $userobjectid);
+                        break;
                 }
+            }
+        } catch (moodle_exception $e) {
+            static::log_user_role_sync_outcome(
+                'Microsoft Graph API error: ' . $e->getMessage(),
+                $userid,
+                $courseid,
+                $e
+            );
+            return self::USER_ROLE_SYNC_GRAPH_ERROR;
+        }
+
+        return self::USER_ROLE_SYNC_SUCCESS;
+    }
+
+    /**
+     * Log why syncing a user's role in a course group did not complete.
+     *
+     * The message is written with mtrace() when running from the CLI (cron, scheduled and ad-hoc tasks) so that it appears in the
+     * task log. It is never echoed during web requests (e.g. the synchronous call from the user_connected observer at login);
+     * in all cases it is also sent to the plugin debug log, which is recorded when the local_o365 "debugmode" setting is on.
+     *
+     * @param string $reason Human-readable reason.
+     * @param int $userid Moodle user ID.
+     * @param int $courseid Moodle course ID.
+     * @param \Throwable|null $exception Optional exception to attach to the debug log.
+     * @return void
+     */
+    protected static function log_user_role_sync_outcome(
+        string $reason,
+        int $userid,
+        int $courseid,
+        ?\Throwable $exception = null
+    ): void {
+        $message = 'Not syncing user ' . $userid . ' in course ' . $courseid . ' to Microsoft 365 group: ' . $reason;
+
+        if (defined('CLI_SCRIPT') && CLI_SCRIPT) {
+            mtrace('... ' . $message);
+        }
+
+        \local_o365\utils::debug($message, 'local_o365\feature\coursesync\utils::sync_user_role_in_course_group', $exception);
+    }
+
+    /**
+     * Queue course group membership sync ad-hoc tasks for all courses a user is enrolled in.
+     *
+     * Used when a Moodle user is mapped to a Microsoft Entra ID user (i.e. a local_o365_objects record with type 'user' is created)
+     * after the user was already enrolled in courses. Without this, enrolments made before the mapping existed are never pushed to
+     * the connected Microsoft 365 groups, because the event-driven sync silently skips users without a mapping.
+     *
+     * One usergroupmembershipsync ad-hoc task is queued per course that is enabled for sync and connected to a Microsoft 365 group.
+     * The custom data matches what the role/enrolment observers queue, so duplicates are not created. Enrolment status is checked
+     * by the task itself, so suspended or expired enrolments are included here on purpose (the task removes such users).
+     *
+     * @param int $userid Moodle user ID.
+     * @return int Number of ad-hoc tasks queued.
+     */
+    public static function queue_course_group_sync_for_user(int $userid): int {
+        global $DB;
+
+        if (empty($userid) || static::is_enabled() !== true) {
+            return 0;
+        }
+
+        $courseusersyncdirection = get_config('local_o365', 'courseusersyncdirection');
+        if ($courseusersyncdirection == COURSE_USER_SYNC_DIRECTION_TEAMS_TO_MOODLE) {
+            return 0;
+        }
+
+        $courses = enrol_get_users_courses($userid, false);
+        if (empty($courses)) {
+            return 0;
+        }
+
+        // Find which of the user's courses are connected to a Microsoft 365 group.
+        [$insql, $params] = $DB->get_in_or_equal(array_keys($courses), SQL_PARAMS_NAMED);
+        $params['type'] = 'group';
+        $params['subtype'] = 'course';
+        $sql = "SELECT DISTINCT moodleid
+                  FROM {local_o365_objects}
+                 WHERE type = :type
+                   AND subtype = :subtype
+                   AND moodleid {$insql}";
+        $connectedcourseids = $DB->get_fieldset_sql($sql, $params);
+
+        $queued = 0;
+        foreach ($connectedcourseids as $courseid) {
+            $courseid = (int) $courseid;
+            if (static::is_course_sync_enabled($courseid) !== true) {
+                continue;
+            }
+
+            $task = new usergroupmembershipsync();
+            $task->set_custom_data(['userid' => $userid, 'courseid' => $courseid, 'excluderoleid' => 0]);
+            if (manager::queue_adhoc_task($task, true)) {
+                $queued++;
             }
         }
 
-        return true;
+        return $queued;
     }
 
     /**
