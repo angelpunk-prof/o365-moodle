@@ -137,6 +137,9 @@ $tasks = [
     [
         'classname' => 'local_o365\task\coursegroupmembershipreconcile',
         'blocking' => 0,
+        // Disabled by default: the reconciliation removes Microsoft 365 group members / owners who are not enrolled in the
+        // Moodle course (e.g. users added directly in Teams). Enable it deliberately in Scheduled tasks.
+        'disabled' => 1,
         'minute' => '17',
         'hour' => '2',
         'day' => '*',
